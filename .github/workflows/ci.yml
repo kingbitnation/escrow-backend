@@ -2,9 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, "fix/**"]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 jobs:
   build:
@@ -24,5 +25,11 @@ jobs:
       - name: Type check
         run: npx tsc --noEmit
 
+      - name: Tests
+        run: npm test
+
       - name: Build
         run: npm run build
+
+      - name: Test
+        run: npm test

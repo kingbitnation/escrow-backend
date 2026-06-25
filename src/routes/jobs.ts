@@ -10,6 +10,14 @@ import {
 } from "@stellar/stellar-sdk";
 import { Server } from "@stellar/stellar-sdk/rpc";
 import { getJobsByWallet } from "../indexer/db.js";
+import { jobContractRateLimit } from "../middleware/job-contract-rate-limit.js";
+import {
+  jobContractCors,
+  jobContractSecurityHeaders,
+} from "../middleware/job-contract-security.js";
+import { sendError, sendSuccess } from "../utils/api-response.js";
+import { isValidStellarContractId } from "../utils/stellar.js";
+import { strictLimiter } from "../middleware/rateLimiter.js";
 
 const router = Router();
 const CONTRACT_ID = process.env.CONTRACT_ID || "";
@@ -67,9 +75,33 @@ router.get("/by-wallet/:address", (req: Request, res: Response) => {
 });
 
 // GET /api/jobs/:contractId - get job state
-router.get("/:contractId", async (req: Request, res: Response) => {
+router.get(
+  "/:contractId",
+  jobContractCors,
+  jobContractSecurityHeaders,
+  jobContractRateLimit,
+  async (req: Request, res: Response) => {
+  const { contractId } = req.params;
+
+  if (!isValidStellarContractId(contractId as string)) {
+    sendError(
+      res,
+      400,
+      "contractId must be a valid Stellar contract address (C...)"
+    );
+    return;
+  }
+
+  const requiredApiKey = process.env.API_KEY;
+  if (requiredApiKey) {
+    const providedKey = req.header("x-api-key");
+    if (providedKey !== requiredApiKey) {
+      sendError(res, 401, "Unauthorized");
+      return;
+    }
+  }
+
   try {
-    const { contractId } = req.params;
     const contract = new Contract(contractId as string);
     const account = await server.getAccount(process.env.DEPLOYER_ADDRESS || "");
     const tx = new TransactionBuilder(account, {
@@ -81,13 +113,41 @@ router.get("/:contractId", async (req: Request, res: Response) => {
       .build();
 
     const result = await server.simulateTransaction(tx);
-    const job = parseJobFromResult(result, contractId as string);
 
-    res.json({ success: true, data: job });
+    if ("error" in result) {
+      const errorMsg = String(result.error);
+      if (
+        /not found|NotFound|contract not found/i.test(errorMsg) ||
+        /contract error #1\b/i.test(errorMsg)
+      ) {
+        sendError(res, 404, "Job not found");
+        return;
+      }
+      sendError(res, 500, errorMsg);
+      return;
+    }
+
+    const job = parseJobFromResult(result, contractId as string);
+    if (!job) {
+      sendError(res, 404, "Job not found");
+      return;
+    }
+
+    sendSuccess(res, job);
   } catch (err: any) {
-    res.status(500).json({ success: false, error: err.message });
+    const message = err?.message ?? "Internal server error";
+    if (/unauthorized|authentication|401/i.test(message)) {
+      sendError(res, 401, "Unauthorized");
+      return;
+    }
+    if (/not found|404/i.test(message)) {
+      sendError(res, 404, "Job not found");
+      return;
+    }
+    sendError(res, 500, message);
   }
-});
+  }
+);
 
 // GET /api/jobs/:contractId/whitelist - get whitelisted tokens
 router.get("/:contractId/whitelist", async (req: Request, res: Response) => {
@@ -137,7 +197,7 @@ router.get("/:contractId/whitelist", async (req: Request, res: Response) => {
 });
 
 // POST /api/jobs/build-tx - build an unsigned transaction for the frontend to sign
-router.post("/build-tx", async (req: Request, res: Response) => {
+router.post("/build-tx", strictLimiter, async (req: Request, res: Response) => {
   try {
     const { contractId, method, args, sourceAddress } = req.body;
     const contract = new Contract(contractId as string);
@@ -283,7 +343,7 @@ router.post("/:contractId/milestones/:index/claim-auto-release", async (req: Req
 });
 
 // POST /api/jobs/submit - submit a signed transaction
-router.post("/submit", async (req: Request, res: Response) => {
+router.post("/submit", strictLimiter, async (req: Request, res: Response) => {
   try {
     const { signedXdr } = req.body;
     const { TransactionBuilder: TB } = await import("@stellar/stellar-sdk");
